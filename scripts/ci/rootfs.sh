@@ -96,5 +96,7 @@ fi
     if [ -n "$BIN_SHA" ]; then echo "bin_sha256=$BIN_SHA"; fi
 } >> "${GITHUB_OUTPUT:-/dev/null}"
 
-ls -R rootfs | head -20
+# ⚠ 纯信息展示：head 提前关管道会让 ls 报 broken pipe，pipefail 下会误杀整个
+# 步骤（实测 run 43364354052 资产/校验/ELF 全部成功，死在这行装饰上）。|| true 中和。
+ls -R rootfs | head -20 || true
 du -sh rootfs
