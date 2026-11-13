@@ -42,6 +42,9 @@ fi
 # ⚠ rt/bin 也要补：customize.sh 里的 set_perm_recursive 会把数据目录下的文件统一改成
 #   0600，rt 里那份二进制会被顺手收掉可执行位。
 chmod 755 "$MODDIR"/*.sh "$MODDIR/bin/"* "$MODDIR/lib/ld-linux-aarch64.so.1" "$WORK/rt/bin/"* 2>/dev/null
+# dnsfix/dnsproxy 同理：网关运行时自己解出来的二进制，被流程收成 0600 后
+# 网关 exec 它永远 EACCES、且不重试，整套外连直接 DNS 瘫痪（详见 dnsd.sh 头注释）。
+ag2a_dns_fix_perms
 
 stop_gw() {
     [ -n "$(ag2a_pids)" ] || return 0
@@ -140,6 +143,43 @@ stop_update_timer() {
     return 0
 }
 
+# ---------- dnsproxy 保活器（本地 DNS，为什么需要见 dnsd.sh 头注释） ----------
+# 与 update timer 同款：setsid 脱离会话 + pidfile 幂等；dnsd 内部用 wait 守着
+# dnsproxy，活着零 CPU。start/stop 都可放心重复调。
+start_dnsd() {
+    [ -n "$(ag2a_dnsd_pid)" ] && return 0
+    setsid sh "$MODDIR/dnsd.sh" >/dev/null 2>&1 < /dev/null &
+    return 0
+}
+
+stop_dnsd() {
+    _d=$(ag2a_dnsd_pid) || { rm -f "$WORK/dnsd.pid" "$WORK/dnsproxy.pid" 2>/dev/null; return 0; }
+    kill "$_d" 2>/dev/null
+    # 它 trap 里要带走 dnsproxy，给最多 3 秒
+    _i=0
+    while [ "$_i" -lt 15 ] && kill -0 "$_d" 2>/dev/null; do
+        sleep 0.2 2>/dev/null || sleep 1
+        _i=$((_i + 1))
+    done
+    kill -9 "$_d" 2>/dev/null
+    # 兜底：dnsd 被 SIGKILL 没带走 dnsproxy 时，按子进程 pidfile 精确补刀。
+    # 同样必须校验 cmdline：pid 复用会误杀无关进程。
+    _cp=$(cat "$WORK/dnsproxy.pid" 2>/dev/null)
+    case "$_cp" in
+        '' | *[!0-9]*) : ;;
+        *)
+            if kill -0 "$_cp" 2>/dev/null &&
+               grep -q 'dnsfix/dnsproxy' "/proc/$_cp/cmdline" 2>/dev/null; then
+                kill "$_cp" 2>/dev/null
+                sleep 0.2 2>/dev/null || sleep 1
+                kill -9 "$_cp" 2>/dev/null
+            fi
+            ;;
+    esac
+    rm -f "$WORK/dnsd.pid" "$WORK/dnsproxy.pid" 2>/dev/null
+    return 0
+}
+
 # ---------- 起不来时留证据 ----------
 # 网关自己崩掉时日志有报错；但如果它连一行都没打出来（loader 找不到、ELF 不兼容、
 # 配置写坏直接退出），run.log 里就什么都没有，只剩看门狗在「重拉」。
@@ -164,12 +204,12 @@ diag_dump() {
 }
 
 case "$1" in
-    stop)    stop_watchdog; stop_gw; stop_update_timer; exit 0 ;;
+    stop)    stop_watchdog; stop_gw; stop_update_timer; stop_dnsd; exit 0 ;;
     # ⛔ restart 必须落到 start 分支：只写「停三件套」的话，后面
     #    `[ -z "$1" ] || [ "$1" = "start" ]` 不成立，会一路掉到文件末尾的
     #    前台 exec ⇒ restart 永不返回（调用方例如 Shizuku/面板会超时），
     #    而且看门狗不会被拉起。用 set -- start 复写参数，走同一套后台流程。
-    restart) stop_watchdog; stop_gw; stop_update_timer; set -- start ;;
+    restart) stop_watchdog; stop_gw; stop_update_timer; stop_dnsd; set -- start ;;
     crontab) stop_update_timer; start_update_timer; exit 0 ;;
 esac
 
@@ -179,7 +219,7 @@ if [ "$1" != "restart" ] && [ "$1" != "run" ] && [ -n "$(ag2a_pids)" ]; then
     case "$1" in
         # 空参数 = 开机流程调用（APatch/Magisk 都是无参执行 service.sh），
         # 必须和 start 同等对待，否则看门狗在本分支下不会被拉起。
-        start | "") start_watchdog; start_update_timer ;;
+        start | "") start_watchdog; start_update_timer; start_dnsd ;;
         crontab)    stop_update_timer; start_update_timer ;;
     esac
     # ⚠ 这里也要刷：开机时进本分支（网关已由看门狗拉起）如果不刷，说明行就永远停在
@@ -224,6 +264,10 @@ fi
 
 # 日志归档：只在冷启动做一次（此刻没有写入者，mv 安全）
 [ -f "$WORK/boot.marker" ] || ag2a_rotate "$WORK/run.log" 5242880
+
+# 本地 DNS：开机（start）、看门狗重拉与点「执行」（run）都会路过这里；
+# dnsd 已在跑就是空操作。它发现 53 已被别人监听会自行体面退出，不抢端口。
+start_dnsd
 
 cd "$WORK" || exit 1
 

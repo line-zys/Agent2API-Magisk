@@ -44,12 +44,16 @@ rm -f /data/adb/ag2a/ld.so 2>/dev/null
 # 兜底：老版本的常驻循环 / 网关进程（v1.5.x 及以前）
 # 四条路径都要扫：v1.9.0 起网关从 rt/ 起，模块目录里那份只是回退（见 lib.sh）
 pkill -f "$MODDIR/control.sh" 2>/dev/null
+pkill -f "$MODDIR/dnsd.sh" 2>/dev/null
+pkill -f "$WORK/dnsfix/dnsproxy" 2>/dev/null
 pkill -f "$MODDIR/updater.sh" 2>/dev/null
 pkill -f "$MODDIR/bin/agent2api-server" 2>/dev/null
 pkill -f "$WORK/rt/bin/agent2api-server" 2>/dev/null
 pkill -f "/data/adb/modules_update/ag2a/bin/agent2api-server" 2>/dev/null
 sleep 1
 pkill -9 -f "$MODDIR/control.sh" 2>/dev/null
+pkill -9 -f "$MODDIR/dnsd.sh" 2>/dev/null
+pkill -9 -f "$WORK/dnsfix/dnsproxy" 2>/dev/null
 pkill -9 -f "$MODDIR/updater.sh" 2>/dev/null
 pkill -9 -f "$MODDIR/bin/agent2api-server" 2>/dev/null
 pkill -9 -f "$WORK/rt/bin/agent2api-server" 2>/dev/null

@@ -39,7 +39,7 @@ RUNTIME = {
     os.path.join(ROOTFS, "usr", "share", "zoneinfo", "Asia", "Shanghai"): "zoneinfo/Asia/Shanghai",
 }
 
-SHELLS = ["service.sh", "control.sh", "refresh.sh", "rt.sh", "updater.sh", "action.sh", "uninstall.sh", "watchdog.sh"]
+SHELLS = ["service.sh", "control.sh", "refresh.sh", "rt.sh", "updater.sh", "action.sh", "uninstall.sh", "watchdog.sh", "dnsd.sh"]
 EXEC = set(SHELLS) | {"customize.sh", "check.sh"}
 
 EM_AARCH64 = 0xB7   # 防呆：曾经把 amd64 的 so 打进包里

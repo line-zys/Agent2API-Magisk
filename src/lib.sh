@@ -335,3 +335,117 @@ ag2a_seed_admin() {
             return 1 ;;
     esac
 }
+
+# ---------- 本地 DNS（dnsfix） ----------
+# 背景：glibc 解析走 /etc/resolv.conf，没有这个文件就回落 127.0.0.1:53。Android 没有
+# resolv.conf，所以网关和所有 glibc 二进制的域名解析只有本地 53 端口一条路——
+# $WORK/dnsfix/dnsproxy 就是填这个位的（网关运行时自己解出来并拉起，壳层以前不管）。
+# 出过的两档子事：
+#   1) 解出来的 dnsproxy 没有执行位（0600），execve 永远 EACCES 且网关不重试；
+#   2) dnsproxy 被优雅停掉一次后，网关运行期间不会再拉。
+# 两种情况症状相同：外连全部报「无法连接上游 / dns error」，且不重启服务不会自愈。
+# 壳层兜底：ag2a_dns_fix_perms 每次启动纠执行位；dnsd.sh 事件驱动保活
+# （wait 不轮询），网关自己把端口占了 dnsd 会自动让位。
+
+# 执行位自愈。目录可能还不存在（首启、或这版网关不用 dnsfix），静默失败
+ag2a_dns_fix_perms() {
+    chmod 755 "$(ag2a_data_dir)/dnsfix/dnsproxy" 2>/dev/null
+    return 0
+}
+
+# 127.0.0.1:53（或通配 / IPv6）有没有人 LISTEN。
+# 与 ag2a_port_listen 同路数：只读 /proc/net/tcp{,6}，一次 awk 判完，不 fork 不联网。
+# 53 = 0x0035。有人在听就别再抢——可能是网关自己拉起来的，也可能是 AdGuard 之类。
+ag2a_dns_listen() {
+    awk '
+        FNR == 1 { next }
+        $4 == "0A" { n = split($2, a, ":"); if (a[n] == "0035") { f = 1; exit } }
+        END { exit(f ? 0 : 1) }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+# 上游 DNS 列表，输出成 dnsproxy 的 -u 参数串（调用方故意不做引号包裹，逐词传给 exec）。
+# 可配文件：$WORK/dnsfix/upstreams，一行一条，内容原样作为 -u 参数，支持
+# udp://x.x.x.x:53、tcp://、以及 DoH/DoT URL；整行 # 开头是注释。
+# 只接受安全字符集（防脏行把命令拆坏），最多 6 条；文件缺失/没有有效行 = 阿里 + DNSPod。
+ag2a_dns_upstreams() {
+    _uf="$(ag2a_data_dir)/dnsfix/upstreams"
+    _ul=""
+    if [ -r "$_uf" ]; then
+        _ul=$(sed -e 's/\r$//' "$_uf" 2>/dev/null \
+              | grep -v '^[[:space:]]*#' \
+              | tr -d ' \t' \
+              | grep -E '^[A-Za-z0-9+._/:@%?&=-]+$' \
+              | head -n 6)
+    fi
+    [ -n "$_ul" ] || _ul="udp://223.5.5.5:53
+udp://119.29.29.29:53"
+    for _u in $_ul; do printf -- '-u %s ' "$_u"; done
+}
+
+# dnsd 的 pid；没在跑返回非 0。与 watchdog 同款：pidfile + cmdline 双重校验，
+# 防 pid 复用把无关进程当自己的（然后被 kill）。
+ag2a_dnsd_pid() {
+    _dp=$(cat "$(ag2a_data_dir)/dnsd.pid" 2>/dev/null)
+    case "$_dp" in '' | *[!0-9]*) return 1 ;; esac
+    kill -0 "$_dp" 2>/dev/null || return 1
+    grep -q 'dnsd\.sh' "/proc/$_dp/cmdline" 2>/dev/null || return 1
+    echo "$_dp"
+}
+
+# ---------- 本地 DNS（dnsfix） ----------
+# 背景：glibc 解析走 /etc/resolv.conf，没有这个文件就回落 127.0.0.1:53。Android 没有
+# resolv.conf，所以网关和所有 glibc 二进制的域名解析只有本地 53 端口一条路——
+# $WORK/dnsfix/dnsproxy 就是填这个位的（网关运行时自己解出来并拉起，壳层以前不管）。
+# 出过的两档子事：
+#   1) 解出来的 dnsproxy 没有执行位（0600），execve 永远 EACCES 且网关不重试；
+#   2) dnsproxy 被优雅停掉一次后，网关运行期间不会再拉。
+# 两种情况症状相同：外连全部报「无法连接上游 / dns error」，且不重启服务不会自愈。
+# 壳层兜底：ag2a_dns_fix_perms 每次启动纠执行位；dnsd.sh 事件驱动保活
+# （wait 不轮询），网关自己把端口占了 dnsd 会自动让位。
+
+# 执行位自愈。目录可能还不存在（首启、或这版网关不用 dnsfix），静默失败
+ag2a_dns_fix_perms() {
+    chmod 755 "$(ag2a_data_dir)/dnsfix/dnsproxy" 2>/dev/null
+    return 0
+}
+
+# 127.0.0.1:53（或通配 / IPv6）有没有人 LISTEN。
+# 与 ag2a_port_listen 同路数：只读 /proc/net/tcp{,6}，一次 awk 判完，不 fork 不联网。
+# 53 = 0x0035。有人在听就别再抢——可能是网关自己拉起来的，也可能是 AdGuard 之类。
+ag2a_dns_listen() {
+    awk '
+        FNR == 1 { next }
+        $4 == "0A" { n = split($2, a, ":"); if (a[n] == "0035") { f = 1; exit } }
+        END { exit(f ? 0 : 1) }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+# 上游 DNS 列表，输出成 dnsproxy 的 -u 参数串（调用方故意不做引号包裹，逐词传给 exec）。
+# 可配文件：$WORK/dnsfix/upstreams，一行一条，内容原样作为 -u 参数，支持
+# udp://x.x.x.x:53、tcp://、以及 DoH/DoT URL；整行 # 开头是注释。
+# 只接受安全字符集（防脏行把命令拆坏），最多 6 条；文件缺失/没有有效行 = 阿里 + DNSPod。
+ag2a_dns_upstreams() {
+    _uf="$(ag2a_data_dir)/dnsfix/upstreams"
+    _ul=""
+    if [ -r "$_uf" ]; then
+        _ul=$(sed -e 's/\r$//' "$_uf" 2>/dev/null \
+              | grep -v '^[[:space:]]*#' \
+              | tr -d ' \t' \
+              | grep -E '^[A-Za-z0-9+._/:@%?&=-]+$' \
+              | head -n 6)
+    fi
+    [ -n "$_ul" ] || _ul="udp://223.5.5.5:53
+udp://119.29.29.29:53"
+    for _u in $_ul; do printf -- '-u %s ' "$_u"; done
+}
+
+# dnsd 的 pid；没在跑返回非 0。与 watchdog 同款：pidfile + cmdline 双重校验，
+# 防 pid 复用把无关进程当自己的（然后被 kill）。
+ag2a_dnsd_pid() {
+    _dp=$(cat "$(ag2a_data_dir)/dnsd.pid" 2>/dev/null)
+    case "$_dp" in '' | *[!0-9]*) return 1 ;; esac
+    kill -0 "$_dp" 2>/dev/null || return 1
+    grep -q 'dnsd\.sh' "/proc/$_dp/cmdline" 2>/dev/null || return 1
+    echo "$_dp"
+}

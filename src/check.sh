@@ -36,6 +36,24 @@ PORT=$(ag2a_get_port)
 echo "  port=$PORT"
 (netstat -ltnp 2>/dev/null || ss -ltnp 2>/dev/null) | grep ":$PORT" || echo "  未监听（进程没起来）"
 
+echo "== 本地 DNS（dnsfix）=="
+if ag2a_dns_listen; then
+    echo "  127.0.0.1:53: 在听（网关一组的域名解析可用）"
+elif [ -f "$WORK/dnsfix/dnsproxy" ]; then
+    echo "  127.0.0.1:53: 没在听 ⚠ 网关外连将全部 DNS 失败"
+else
+    echo "  127.0.0.1:53: 没在听（dnsproxy 还没解出来，网关还没用上 dnsfix，正常）"
+fi
+_dd=$(ag2a_dnsd_pid)
+[ -n "$_dd" ] && echo "  保活器 dnsd: 在跑（pid $_dd）" || echo "  保活器 dnsd: 未运行"
+if [ -f "$WORK/dnsfix/dnsproxy" ]; then
+    if [ -x "$WORK/dnsfix/dnsproxy" ]; then
+        echo "  dnsproxy: $(wc -c < "$WORK/dnsfix/dnsproxy" | tr -d ' ') B，执行位 ok"
+    else
+        echo "  dnsproxy: ⚠ 缺执行位！跑 sh $MODDIR/service.sh restart 修复"
+    fi
+fi
+
 echo "== 进程 =="
 ag2a_running && { echo "  pid: $(ag2a_pids | tr '\n' ' ')"; } || echo "  未运行"
 
