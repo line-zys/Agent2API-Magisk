@@ -61,9 +61,12 @@ set_perm_recursive "$DATA_DIR" 0 0 0700 0600
 #   用 read 会永久阻塞（现象＝进度条卡住、提示也不显示），用 echo 也不显示。
 # 业界可行做法（OpenList-Magisk / box_for_magisk 等）是读 /dev/input 的音量键：
 #   音量下 = 切下一项，音量上 = 确认。
-# ⚠ 必须带倒计时：早年这里是无超时的死等，不按键就永远卡在进度条上，
-#   用户以为刷坏了。现在 5 秒没动就采用当前项（默认项都是「不改动」那一个）。
+# ⚠ 第一个问题必须带倒计时：早年这里是无超时的死等，不按键就永远卡在进度条上，
+#   用户以为刷坏了。现在 5 秒内一个键都不按＝**全部取默认值、剩下的问题一个都不再问**
+#   （免配置）。想改的人自然会在这 5 秒内按键，那时后面的问题就一直等他按。
 AG2A_PICK_TIMEOUT=${AG2A_PICK_TIMEOUT:-5}
+# 第一题超时未按键 → 1：调用方据此跳过后面所有提问
+PICK_DEFAULT_ALL=0
 
 _key_once() {
     # 最多阻塞 1 秒；只认 KEY_VOLUMEUP / KEY_VOLUMEDOWN 的按下事件。
@@ -85,11 +88,17 @@ _nth() {
 }
 
 # choose "标题" 默认序号 选项1 选项2 ...  ⇒ 结果在 $CHOICE，采用值在 $PICKED
-# 交互：音量下切项、音量上确认；${AG2A_PICK_TIMEOUT} 秒内没有任何按键＝自动确认当前项。
+# 交互：音量下切项、音量上确认。
+# 只有**第一个**问题带 ${AG2A_PICK_TIMEOUT} 秒倒计时；5 秒内一个键都没按就置
+# PICK_DEFAULT_ALL=1（调用方跳过后面所有问题，全用默认值＝免配置）。
+# 按过键（哪怕只切了项没确认）就说明人在场，后面的问题一直等他按，不再倒计时。
 choose() {
     _ct=$1; _cd=$2; shift 2
     _cn=$#
     _cur=$_cd
+    _to=${_pick_timeout:-$AG2A_PICK_TIMEOUT}
+    _pick_timeout=0                     # 用完即清：只有第一个菜单倒计时
+    case "$_to" in '' | *[!0-9]*) _to=0 ;; esac
     if ! command -v getevent >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
         CHOICE=$_cd
         PICKED=$(_nth "$_cd" "$@")
@@ -97,26 +106,45 @@ choose() {
         return
     fi
     ui_print " "
-    ui_print "- $_ct: 音量下=切换  音量上=确认  不按=${AG2A_PICK_TIMEOUT}秒后自动确认"
+    if [ "$_to" -gt 0 ]; then
+        ui_print "- $_ct: 音量下=切换  音量上=确认  不按=${_to}秒后全部用默认值"
+    else
+        ui_print "- $_ct: 音量下=切换  音量上=确认"
+    fi
     ui_print "  → $(_nth "$_cur" "$@")"
-    _left=$AG2A_PICK_TIMEOUT
+    _left=$_to
     _picked_by_key=0
-    while [ "$_left" -gt 0 ]; do
+    _any_key=0
+    while :; do
         case "$(_key_once)" in
             down)
+                _any_key=1
                 _cur=$((_cur % _cn + 1))
-                _left=$AG2A_PICK_TIMEOUT
-                ui_print "  → $(_nth "$_cur" "$@")  (${_left}s)" ;;
+                if [ "$_to" -gt 0 ]; then
+                    ui_print "  → $(_nth "$_cur" "$@")  (${_to}s)"
+                else
+                    ui_print "  → $(_nth "$_cur" "$@")"
+                fi ;;
             up)
+                _any_key=1
                 _picked_by_key=1
-                _left=0
                 break ;;
         esac
+        [ "$_to" -gt 0 ] || continue
         _left=$((_left - 1))
-        [ "$_left" -gt 0 ] && ui_print "  …${_left}s"
-        # getevent 已阻塞约 1 秒，这里不再补 sleep，免得把倒计时拉长到 2 倍
+        if [ "$_left" -gt 0 ]; then
+            ui_print "  …${_left}s"
+        else
+            break
+        fi
     done
-    [ "$_picked_by_key" = "0" ] && ui_print "  (${AG2A_PICK_TIMEOUT} 秒内没有操作，采用当前项)"
+    if [ "$_to" -gt 0 ] && [ "$_picked_by_key" = "0" ]; then
+        ui_print "  (${_to} 秒内没有操作，采用当前项)"
+    fi
+    # 第一题 5 秒内一个键都没按 ⇒ 免配置：后面的问题全部不问
+    if [ "$_to" -gt 0 ] && [ "$_any_key" = "0" ]; then
+        PICK_DEFAULT_ALL=1
+    fi
     CHOICE=$_cur
     PICKED=$(_nth "$_cur" "$@")
     # 确认后停一下：音量上键松开得慢的话，残留事件会把下一个问题也秒确认掉
@@ -137,7 +165,7 @@ if [ -s "$DATA_DIR/port" ] || [ -s "$DATA_DIR/env" ]; then _installed=1; fi
 
 # ---------- 已安装：第一个问题就问要不要动配置 ----------
 # 升级安装最怕的就是「刷一下配置全被重置」，所以默认项是「保持默认」，
-# 音量上直接确认＝什么都不改；不倒计时也是它。只有明确选「重新设置」才往下问。
+# 音量上直接确认＝什么都不改；5 秒不按＝全部默认，后面一题都不问。
 RECONF=1
 AUTO_ON=""
 if [ "$_installed" = "1" ]; then
@@ -146,12 +174,13 @@ if [ "$_installed" = "1" ]; then
     ui_print " "
     ui_print "- 检测到已安装：端口 $_sp，自动更新 $_sa"
     choose "是否重新设置" 1 "保持默认（沿用现有配置，不修改）" "重新设置"
-    if [ "$PICKED" = "重新设置" ]; then
-        RECONF=1
-    else
+    if [ "$PICK_DEFAULT_ALL" = "1" ] || [ "$PICKED" != "重新设置" ]; then
         RECONF=0
         PORT=$_sp
+        [ "$PICK_DEFAULT_ALL" = "1" ] && ui_print "- 5 秒内没有按键：全部采用默认值，不再询问"
         ui_print "- 沿用现有配置：端口 $PORT，自动更新 $_sa"
+    else
+        RECONF=1
     fi
 fi
 
@@ -166,18 +195,23 @@ if [ "$RECONF" = "1" ]; then
     choose "网关端口" 1 "$_o1" "$_o2"
     PORT=$PICKED
 
-    # 自动更新：默认项＝当前状态；首次安装默认「关闭」
-    # 理由：GitHub 的两个上游仓库目前都不可达，面板里另有「软件更新」入口，
-    # 在确定最终更新手段之前不该让模块每天 04:00 空跑一次失败。
-    if [ ! -f "$DATA_DIR/update.conf" ]; then
-        _adef=2                                      # 首次安装：关闭
-    elif ag2a_update_on; then
-        _adef=1
+    if [ "$PICK_DEFAULT_ALL" = "1" ]; then
+        # 第一题超时＝免配置：后面一题都不问，自动更新走默认（首次安装＝写 86400 开启）
+        ui_print "- 5 秒内没有按键：端口 $PORT，自动更新用默认值，不再询问"
     else
-        _adef=2
+        # 自动更新：默认项＝当前状态；首次安装默认「开启」
+        # 实测（2026-11-21，OP12）：api.github.com 直连 200 / 1.2 秒，gh-proxy 镜像也通，
+        # 资产下载本来还有镜像兜底 ⇒ 没理由再默认关着（早年关着是因为两个仓库都连不上）。
+        if [ ! -f "$DATA_DIR/update.conf" ]; then
+            _adef=1                                  # 首次安装：开启
+        elif ag2a_update_on; then
+            _adef=1
+        else
+            _adef=2
+        fi
+        choose "自动更新（每天 04:00 查 GitHub Releases，两个仓库都试）" "$_adef" "开启" "关闭"
+        AUTO_ON=$PICKED
     fi
-    choose "自动更新（每天 04:00 查 GitHub Releases，两个仓库都试）" "$_adef" "开启" "关闭"
-    AUTO_ON=$PICKED
 fi
 
 # 管理员：不在刷入时设。面板登录页会自己探测「有没有账号」，没有就切到
@@ -244,8 +278,8 @@ if [ ! -f "$DATA_DIR/update.conf" ]; then
     printf '%s\n' \
         '# 自动更新：每天一次，按下面的钟点触发（updater.sh daemon 睡到点才醒，零 CPU 空转）' \
         '# 关掉：把下面改成 0（或 sh action.sh auto off）；改钟点：sh action.sh auto 03:30' \
-        '# 首次安装默认 0=关闭：两个上游仓库当前都不可达，等更新手段定下来再开' \
-        'AG2A_UPDATE_INTERVAL=0' \
+        '# 首次安装默认 86400=开启（2026-11-21 实测 GitHub API 直连与镜像均可用）' \
+        'AG2A_UPDATE_INTERVAL=86400' \
         'AG2A_UPDATE_AT=04:00' \
         '# 更新后是否重启网关：1=是' \
         'AG2A_UPDATE_RESTART=1' \
