@@ -87,31 +87,41 @@ static int resp_ttl(const uint8_t *p, int n) {
     if (n < 12) return 60;
     int ancount = (p[6] << 8) | p[7];
     if (ancount <= 0) return 30;
+
+    /* 跳过 question 段：QNAME(可能以 0 结尾，也可能是压缩指针) + QTYPE(2) + QCLASS(2) */
     int i = 12;
-    for (int q = 0; q < 2; q++) {
-        while (i < n && p[i] != 0) {
-            if (p[i] & 0xC0) { i += 2; goto q_done; }
-            i += p[i] + 1;
-        }
-        i++;
-    q_done:
-        if (q == 0) i += 4;
+    if (i < n && (p[i] & 0xC0)) {
+        i += 2;
+    } else {
+        while (i < n && p[i] != 0) i += p[i] + 1;
+        i += 1;                                   /* 结尾的 0 */
     }
+    i += 4;                                       /* QTYPE + QCLASS */
+    if (i > n) return 60;
+
     int min = 0x7fffffff;
-    for (int a = 0; a < ancount && i + 10 < n; a++) {
-        while (i < n && p[i] != 0) {
-            if (p[i] & 0xC0) { i += 2; goto a_done; }
-            i += p[i] + 1;
+    for (int a = 0; a < ancount; a++) {
+        if (i >= n) break;
+
+        /* answer 的 NAME：压缩指针(2B) 或 完整域名 + 结尾 0 */
+        if (p[i] & 0xC0) {
+            i += 2;
+        } else {
+            while (i < n && p[i] != 0) i += p[i] + 1;
+            i += 1;
         }
-        i++;
-    a_done:
-        if (i + 10 > n) break;
-        uint32_t ttl = ((uint32_t)p[i] << 24) | ((uint32_t)p[i + 1] << 16) |
-                       ((uint32_t)p[i + 2] << 8) | (uint32_t)p[i + 3];
-        i += 8;
+        if (i + 10 > n) break;                    /* TYPE(2) CLASS(2) TTL(4) RDLEN(2) */
+
+        uint32_t ttl = ((uint32_t)p[i + 4] << 24) | ((uint32_t)p[i + 5] << 16) |
+                       ((uint32_t)p[i + 6] << 8) | (uint32_t)p[i + 7];
+        int rdlen = (p[i + 8] << 8) | p[i + 9];
+
+        /* ⚠ rdlen 来自报文，最大 65535；必须按它跳完后立刻校验，否则 i 冲出 n
+         *   后继续读，会把相邻内存当 TTL（实测能返回 65537 这类不可能的 값）。 */
+        i += 10 + rdlen;
+        if (i > n) break;
+
         if ((int)ttl < min) min = (int)ttl;
-        int rdlen = (p[i - 2] << 8) | p[i - 1];
-        i += rdlen;
     }
     if (min == 0x7fffffff || min < 0) return 60;
     return min;
