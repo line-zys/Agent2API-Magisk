@@ -410,14 +410,34 @@ ag2a_dns_fix_perms() {
     return 0
 }
 
-# 127.0.0.1:53（或通配 / IPv6）有没有人 LISTEN。53 = 0x0035。
-# 与 ag2a_port_listen 同路数：只读 /proc/net/tcp{,6}，一次 awk 判完，不 fork 不联网。
+# 53 端口（或 IPv6）有没有人在听。53 = 0x0035。
+# ⚠ TCP 和 UDP 都要看：dnsstub 是 UDP-only，而已绑定的 UDP socket 状态是 07（不是 TCP 的
+#   0A = LISTEN）。只看 /proc/net/tcp 会永远判「没在听」—— 结果 dnsd 的「53 已被占用就让位」
+#   对最常见的场景（别的 DNS 组件只开 UDP）完全失效，会无限重拉，check.sh 也一直误报
+#   「网关外连将全部 DNS 失败」。
+#   按 FILENAME 区分 udp/tcp（不能数 FNR==1 的序号：没有 IPv6 时 /proc/net/tcp6 打不开，
+#   序号会错位，udp 被当成 tcp 判）。
+# 与 ag2a_port_listen 同路数：只读 /proc/net/*，一次 awk 判完，不 fork 不联网。
 ag2a_dns_listen() {
+    # ⚠ 先把存在的表挑出来再交给 awk：gawk/busybox awk 对**命令行上打不开的文件**
+    #   是致命错误（会直接中止，连后面的表都不看），而少数内核裁掉了 tcp6/udp6。
+    _fl=""
+    for _f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+        [ -r "$_f" ] && _fl="$_fl $_f"
+    done
+    [ -n "$_fl" ] || return 1
+    # shellcheck disable=SC2086
     awk '
-        FNR == 1 { next }
-        $4 == "0A" { n = split($2, a, ":"); if (a[n] == "0035") { f = 1; exit } }
+        FNR == 1 { isudp = (index(FILENAME, "/udp") > 0); next }
+        {
+            n = split($2, a, ":")
+            if (n > 0 && a[n] == "0035") {
+                if (isudp) { if ($4 == "07") { f = 1; exit } }
+                else if ($4 == "0A") { f = 1; exit }
+            }
+        }
         END { exit(f ? 0 : 1) }
-    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+    ' $_fl 2>/dev/null
 }
 
 # dnsproxy 的 -u 参数串（3.5.0 及以前那代用）。故意不做引号包裹，逐词传参。

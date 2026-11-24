@@ -25,11 +25,15 @@ ui_print " Agent2API Gateway · $VER (linux/arm64)"
 ui_print " "
 
 # 架构校验：只发 arm64 包
+# ⚠ 判定失败**不能**直接 abort：某些安装器（或刚起来的环境）PATH 里没有 getprop，
+#   $ABIS 就是空的 —— 以前这一条会让刷入以「需要 arm64 设备」这种完全误导的理由失败。
+#   现在三路兜底：abilist / abi / uname -m，任一命中 arm64 就放行。
 ABI=$(getprop ro.product.cpu.abi 2>/dev/null)
 ABIS=$(getprop ro.product.cpu.abilist 2>/dev/null)
-case "$ABIS" in
-    *arm64-v8a*) : ;;
-    *) ui_print "! 本机 ABI 不是 arm64-v8a（$ABI / $ABIS），这个包跑不了"
+_MACH=$(uname -m 2>/dev/null)
+case "$ABIS$ABI$_MACH" in
+    *arm64* | *aarch64*) : ;;
+    *) ui_print "! 本机不是 arm64（abi=$ABI abilist=$ABIS uname=$_MACH），这个包跑不了"
        abort "! 需要 arm64 设备" ;;
 esac
 
@@ -39,6 +43,9 @@ for _f in action.sh check.sh control.sh refresh.sh rt.sh service.sh uninstall.sh
     [ -f "$MODPATH/$_f" ] && set_perm "$MODPATH/$_f" 0 0 0755
 done
 [ -f "$MODPATH/bin/agent2api-server" ] && set_perm "$MODPATH/bin/agent2api-server" 0 0 0755
+# dnsstub 也要补：KernelSU 的安装器会先 set_perm_recursive 把整包压成 0644，
+# 不在这里补就只能靠 dnsd.sh 运行时 chmod（那之前 check.sh 会误报「未就绪」）。
+[ -f "$MODPATH/bin/dnsstub" ] && set_perm "$MODPATH/bin/dnsstub" 0 0 0755
 # loader 必须可执行，否则网关根本起不来
 [ -f "$MODPATH/lib/ld-linux-aarch64.so.1" ] && set_perm "$MODPATH/lib/ld-linux-aarch64.so.1" 0 0 0755
 for _f in lib/libc.so.6 lib/libm.so.6 lib/libgcc_s.so.1 lib/libpthread.so.0 lib/libdl.so.2 lib/librt.so.1; do
@@ -359,6 +366,9 @@ FINAL_DIR=/data/adb/modules/ag2a
 # 放在 stop 之前做：mv 是原子替换，旧进程握着的旧 inode 要等它退出才回收，不影响它继续跑。
 if AG2A_DATA_DIR="$DATA_DIR" sh "$MODPATH/rt.sh" sync >/dev/null 2>&1; then
     _rt_ok=1
+    # 上面那次 set_perm_recursive 会把数据目录里已有的文件统一收成 0600；
+    # rt.sh 新拷进去的二进制带 0755，这里再兜一遍，免得旧文件被收掉执行位。
+    chmod 755 "$DATA_DIR/rt/bin/"* 2>/dev/null
 else
     _rt_ok=0
 fi

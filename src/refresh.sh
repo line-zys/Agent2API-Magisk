@@ -66,15 +66,36 @@ if [ ! -w "$_mp" ] && [ "$(id -u 2>/dev/null)" != "0" ]; then
     echo "module.prop 不可写，跳过" >&2
     exit 1
 fi
+# 并发保护：刷新点有六处会重叠（service.sh 启动收尾 / 后台 sleep 3 刷 / 看门狗重拉 /
+# action.sh / updater.sh / customize.sh）。以前临时文件名写死成 module.prop.tmp，
+# 两路同时截断同一个文件，就能把半截内容 mv 成 module.prop —— 丢掉 id=/versionCode=
+# 管理器直接判模块无效，用户只能重装。现在：锁目录 + $$ 后缀 + 留一份 .bak。
+_lock="$MODDIR/.refresh.lock"
+if ! mkdir "$_lock" 2>/dev/null; then
+    # 锁存在超过 1 分钟 = 上一次被 KILL 残留，接管（正常刷新只跑几十毫秒）
+    [ -n "$(find "$_lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rmdir "$_lock" 2>/dev/null
+    mkdir "$_lock" 2>/dev/null || exit 0      # 另一个刷新正在进行，让它写
+fi
+trap 'rmdir "$_lock" 2>/dev/null' EXIT INT TERM HUP
+_desc_fail() {
+    echo "$(date '+%m-%d %H:%M') 写 module.prop 失败（$ST）" >> "$WORK/desc.log" 2>/dev/null
+    exit 1
+}
 if [ "$_have" = "1" ]; then
-    if { grep -v '^description=' "$_mp"; printf 'description=%s\n' "$ST"; } > "$_mp.tmp" 2>/dev/null &&
-       mv -f "$_mp.tmp" "$_mp" 2>/dev/null; then
+    _tmp="$_mp.tmp.$$"
+    # grep 必须单独判：`{ grep …; printf …; } > tmp` 的组退出码取最后一条 printf，
+    # grep 读失败也会被当成成功，把 module.prop 写成只剩一行 description。
+    grep -v '^description=' "$_mp" > "$_tmp" 2>/dev/null || { rm -f "$_tmp"; _desc_fail; }
+    printf 'description=%s\n' "$ST" >> "$_tmp" 2>/dev/null || { rm -f "$_tmp"; _desc_fail; }
+    cp -f "$_mp" "$_mp.bak" 2>/dev/null
+    if mv -f "$_tmp" "$_mp" 2>/dev/null; then
         chmod 0644 "$_mp" 2>/dev/null
     else
-        rm -f "$_mp.tmp" 2>/dev/null
-        echo "$(date '+%m-%d %H:%M') 写 module.prop 失败（$ST）" >> "$WORK/desc.log" 2>/dev/null
-        exit 1
+        rm -f "$_tmp" 2>/dev/null
+        _desc_fail
     fi
+else
+    printf 'description=%s\n' "$ST" >> "$_mp" 2>/dev/null || _desc_fail
 fi
 
 [ "$1" = "quiet" ] || printf '%s\n' "$ST"

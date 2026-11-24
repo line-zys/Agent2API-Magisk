@@ -44,7 +44,10 @@ RUNTIME = {
 }
 
 SHELLS = ["service.sh", "control.sh", "refresh.sh", "rt.sh", "updater.sh", "action.sh", "uninstall.sh", "watchdog.sh", "dnsd.sh"]
-EXEC = set(SHELLS) | {"customize.sh", "check.sh"}
+# loader 也要带执行位：KernelSU 的安装器会先 set_perm_recursive 0644 再跑 customize.sh，
+# 这里写对能少一层依赖（正常路径下 customize.sh / service.sh 都还会再兜一次）。
+EXEC = set(SHELLS) | {"customize.sh", "check.sh", "lib/ld-linux-aarch64.so.1"}
+S_IFREG = 0o100000   # zip 的 external_attr 里不带这个位时，部分解压器会按 DOS 属性当普通文件
 
 EM_AARCH64 = 0xB7   # 防呆：曾经把 amd64 的 so 打进包里
 
@@ -96,9 +99,13 @@ def main():
     #     二进制替换，避免换行/编码搅乱；漏替换在打包前直接报错。
     #     updateJson 走 GitHub Pages（raw.githubusercontent 国内连不上，gh-proxy 又要多一跳、
     #     还可能被管理器判超时 ⇒ 拉不到 update.json 就等于「永远没更新」）。
-    self_repo = os.environ.get("AG2A_SELF_REPO", "huxc573/Agent2API-Magisk").strip()
+    self_repo = os.environ.get("AG2A_SELF_REPO", "line-zys/Agent2API-Magisk").strip()
     _owner, _, _name = self_repo.partition("/")
-    pages = ("%s.github.io/%s" % (_owner, _name)) if _name else ""
+    # 不含 "/" 时 pages 会变成空串 ⇒ updateJson=https:///update.json：占位符检查只查
+    # token 残留，查不出这种坏 URL，管理器那边就是「永远查不到更新」。直接拦下。
+    if not _owner or not _name:
+        sys.exit("AG2A_SELF_REPO 必须是 owner/repo，当前是 %r" % self_repo)
+    pages = "%s.github.io/%s" % (_owner, _name)
     subs = [(b"__AG2A_REPO__", self_repo.encode("utf-8")),
             (b"__AG2A_PAGES__", pages.encode("utf-8"))]
     for rel in ("webroot/index.html", "module.prop"):
@@ -190,7 +197,11 @@ def main():
                 zi = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
                 zi.compress_type = zipfile.ZIP_DEFLATED
                 mode = 0o755 if (rel in EXEC or rel.startswith("bin/")) else 0o644
-                zi.external_attr = (mode & 0xFFFF) << 16
+                # create_system=3（Unix）必须显式给：Windows 上打出的包默认 host=0(FAT)，
+                # 只按 mode 高 16 位 chmod 的解压器能拿到 0755，按 host 判定的解压器会把
+                # 整段当 DOS 属性丢掉 ⇒ 全落成 0644。带上 S_IFREG 才是标准的 Unix 条目。
+                zi.create_system = 3
+                zi.external_attr = ((S_IFREG | mode) & 0xFFFF) << 16
                 with open(full, "rb") as f:
                     z.writestr(zi, f.read())
 

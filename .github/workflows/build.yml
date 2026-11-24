@@ -84,27 +84,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci/rootfs.sh "${{ steps.up.outputs.tag }}"
 
-      - name: 编译 dnsstub（本地 DNS 应答器）
+      - name: 编译 dnsstub（本地 DNS 应答器）+ spawnhook
         # 3.5.1 起网关改用进程内解析器，不再自带 dnsproxy；Android 没有
         # /etc/resolv.conf，glibc 会回落到 127.0.0.1:53。必须在 53 上有人应答，
         # 否则所有出站请求 dns error（26.11.24_1 连不上网的根因）。
         # 源码在 src/dnsfix/dnsstub.c，这里现编，免得把二进制提交进仓库。
+        # -pthread：26.11.24_7 起每个查询一个线程（以前串行阻塞，一个上游丢包就
+        #   把整个 53 的应答排队到丢包）。静态链接时 pthread 要显式带上。
+        # spawnhook 也从源码现编：仓库里那份是手工改过 .dynstr 的脏产物
+        #   （.dynsym 里有两条重复的 DT_NEEDED libc.so.6），以后不再依赖它。
         if: steps.up.outputs.skip != '1'
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu
           mkdir -p src/bin
-          aarch64-linux-gnu-gcc -O2 -Wall -static -o src/bin/dnsstub src/dnsfix/dnsstub.c
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -pthread -static -o src/bin/dnsstub src/dnsfix/dnsstub.c
           chmod 0755 src/bin/dnsstub
           file src/bin/dnsstub || true
-          # 防呆：必须是 aarch64 静态 ELF，否则模块在手机上根本起不来
+          aarch64-linux-gnu-gcc -O2 -Wall -shared -fPIC -o src/spawnhook/libspawnhook.so src/spawnhook/spawnhook.c
+          file src/spawnhook/libspawnhook.so || true
+          # 防呆：必须是 aarch64（dnsstub 还得是静态 ELF），否则模块在手机上根本起不来
           python3 - <<'PYEOF'
-          import sys
-          d = open("src/bin/dnsstub", "rb").read(20)
-          if d[:4] != b"\x7fELF" or int.from_bytes(d[18:20], "little") != 0xB7:
-              sys.exit("dnsstub 不是 aarch64 ELF")
-          print("dnsstub aarch64 ok")
+          import sys, struct
+          for path, need_static in (("src/bin/dnsstub", True),
+                                    ("src/spawnhook/libspawnhook.so", False)):
+              d = open(path, "rb").read()
+              if d[:4] != b"\x7fELF" or int.from_bytes(d[18:20], "little") != 0xB7:
+                  sys.exit(path + " 不是 aarch64 ELF")
+              print(path, "aarch64 ok", len(d), "bytes")
           PYEOF
 
       - name: 打包
@@ -131,12 +139,17 @@ jobs:
           # 预发/正式跟随上游那个 release：上游是 beta 我们就标 Pre-release，
           # 上游转正（如 3.4.0）我们也发正式版，正式版才会占用 Latest。
           # 查不到上游标记时 upstream.sh 兜底给 prerelease=1，宁可不转正。
+          # ⚠ create 失败（tag 已存在 / 上一次 job 半途失败）必须能自愈：以前这里
+          #   `set -e` 直接中止，后面「写 update.json」那一步根本不跑 ⇒ Release 发了而
+          #   update.json 永远停在旧版本，管理员那边就是「永远收不到更新提示」。
           if [ "${PRE:-1}" = "0" ]; then
               echo "上游已是正式版 → 本包按正式版发"
-              gh release create "v$V" "$zip" --title "$V" --notes-file notes.md
+              gh release create "v$V" "$zip" --title "$V" --notes-file notes.md \
+                || gh release upload "v$V" "$zip" --clobber
           else
               echo "上游是预览版 → 本包按 Pre-release 发"
-              gh release create "v$V" "$zip" --title "$V" --notes-file notes.md --prerelease
+              gh release create "v$V" "$zip" --title "$V" --notes-file notes.md --prerelease \
+                || gh release upload "v$V" "$zip" --clobber
           fi
           # 顺带把这一版的 changelog.txt 挂成 asset：上游没变、只改内容而重出包时，
           # 后面那步要把它逐字沿用，不能靠「重新生成」（重新生成会按当前 CHANGELOG 取错小节）。
@@ -206,7 +219,13 @@ jobs:
             exit 0
           fi
           git commit -m "chore: 发布 v$V（上游 $UP）"
-          git push
+          # push 在本 job 跑几分钟、期间 main 又被推过时会被拒；先 unshallow 再 rebase 重试
+          if ! git push; then
+            echo "push 被拒，fetch --unshallow + rebase 后重试"
+            git fetch --unshallow --quiet 2>/dev/null || git fetch --quiet origin
+            git pull --rebase --autostash --quiet || true
+            git push
+          fi
 
       - name: 没有新版
         if: steps.up.outputs.skip == '1'

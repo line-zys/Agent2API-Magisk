@@ -34,7 +34,9 @@ auto_status() {
     [ -n "$_ch" ] || _ch=beta
     # 光有开关不算数：daemon 没在跑就不会真的去查。把 pid 也报出来，
     # 「开了却没效果」一眼能看出是定时器没起来还是网络失败。
-    _t=$(tr -dc '0-9' < "$WORK/update.timer.pid" 2>/dev/null)
+    # ⚠ 重定向顺序：`< 文件 2>/dev/null` 里 `<` 先失败、2>/dev/null 还没生效，
+    #   mksh 会把一行 cannot open 直接打到 stderr（看着像报错）。先 cat 再过滤。
+    _t=$(cat "$WORK/update.timer.pid" 2>/dev/null | tr -dc '0-9')
     if [ -z "$_t" ] || ! kill -0 "$_t" 2>/dev/null; then
         echo "开启（每天 $_at，通道 $_ch）｜定时器未运行"
         return
@@ -46,8 +48,10 @@ set_kv() {
     # 注意变量名带 sk_ 前缀：sh 没有 local，叫 _k/_v 会把调用方的同名变量改掉
     _sk=$1; _sv=$2
     [ -f "$CONF" ] || : > "$CONF"
+    # 值直接当 sed 替换串用会把 & \ | 解释掉（例如把 86400 写成 8640&0），先转义
+    _sv_esc=$(printf '%s' "$_sv" | sed -e 's/[&\\|]/\\&/g')
     if grep -q "^[[:space:]]*$_sk=" "$CONF" 2>/dev/null; then
-        sed -i "s|^[[:space:]]*$_sk=.*|$_sk=$_sv|" "$CONF"
+        sed -i "s|^[[:space:]]*$_sk=.*|$_sk=$_sv_esc|" "$CONF"
     else
         printf '%s=%s\n' "$_sk" "$_sv" >> "$CONF"
     fi
@@ -77,9 +81,11 @@ config)
     # 非终端（Magisk 点「操作」按钮、被管道喂）直接打现状，不阻塞。
     # 确实要从管道喂答案时: AG2A_ASSUME_TTY=1 sh action.sh config < answers.txt
     if [ ! -t 0 ] && [ -z "$AG2A_ASSUME_TTY" ]; then
+        _u0=$(head -n1 "$WORK/admin_user" 2>/dev/null | tr -d '\r')
+        [ -n "$_u0" ] || _u0=root
         echo "当前配置（要改请在终端跑 su -c 'sh $0 config'）"
         echo "  端口        $(ag2a_get_port)"
-        echo "  管理员      $(head -n1 "$WORK/admin_user" 2>/dev/null || echo root) / $( [ -f "$WORK/admin.json" ] && echo '已建号' || echo '待播种' )"
+        echo "  管理员      $_u0 / $( [ -f "$WORK/admin.json" ] && echo '已建号' || echo '待播种' )"
         echo "  自动更新    $(auto_status)"
         exit 0
     fi
@@ -89,7 +95,11 @@ config)
     # 1) 端口
     _cp=$(ag2a_get_port)
     printf '端口 [%s]: ' "$_cp"
-    read -r _v
+    # ⚠ 每问都要先把变量清空：read 失败（stdin 提前 EOF）时**不会**改写变量，
+    #   以前第 1 问填的端口会被第 2 问当成用户名接下去，字符集校验还能过 ⇒
+    #   admin_user 被写成 3065。非交互场景（脚本/Shizuku 喂答案）必须中止。
+    _v=""
+    read -r _v || { echo; echo "  输入结束，中止（什么都没改）"; exit 1; }
     [ -n "$_v" ] || _v=$_cp
     case "$_v" in
         '' | *[!0-9]*) echo "  跳过：不是数字" ;;
@@ -105,21 +115,31 @@ config)
     _cu=$(head -n1 "$WORK/admin_user" 2>/dev/null | tr -d '\r')
     [ -n "$_cu" ] || _cu=root
     printf '管理员用户名 [%s]: ' "$_cu"
-    read -r _v
+    _v=""
+    read -r _v || { echo; echo "  输入结束，中止（什么都没改）"; exit 1; }
     [ -n "$_v" ] || _v=$_cu
     case "$_v" in '' | *[!A-Za-z0-9_.@-]*) echo "  跳过：只允许字母数字 _ . @ -"; _v=$_cu ;; esac
     printf '管理员密码（≥8 位，回车不改）: '
-    read -r _p
+    _p=""
+    read -r _p || { echo; echo "  输入结束，中止（什么都没改）"; exit 1; }
     if [ -n "$_p" ] || [ "$_v" != "$_cu" ]; then
         [ "${#_p}" -ge 8 ] || _p=""
         if [ -f "$WORK/admin.json" ]; then
             echo "  账号已建好，上游没有改密/改名接口，只能清掉账号库重建。"
             echo "  这会丢面板里的配置项，需要重新登录；客户端 api_key 在 config.json 里，不受影响。"
             printf '  确认重建? [y/N]: '
-            read -r _yn
+            _yn=""
+            read -r _yn || _yn="n"
             case "$_yn" in
-                y* | Y*) rm -f "$WORK/proxy.db" "$WORK/admin.json" "$WORK/.admin.pending"
-                         echo "  已清账号库" ;;
+                y* | Y*) _ndb=0
+                         for _db in "$WORK"/*.db; do
+                             [ -f "$_db" ] || continue
+                             rm -f "$_db" && _ndb=$((_ndb + 1))
+                         done
+                         rm -f "$WORK/admin.json" "$WORK/.admin.pending"
+                         # 与 `action.sh reset` 同一口径：清就清全部 db，否则重建后旧库里
+                         # 还留着管理员，登录页不会回到「创建账号」
+                         echo "  已清账号库（$_ndb 个 db）" ;;
                 *) echo "  跳过管理员修改"; _p=""; _v=""; ;;
             esac
         fi
@@ -139,7 +159,8 @@ config)
     # 3) 自动更新
     echo "自动更新现在是 $(auto_status)"
     printf '自动更新钟点（HH:MM，输 off 关闭，回车不改）: '
-    read -r _v
+    _v=""
+    read -r _v || { echo; echo "  输入结束，中止"; exit 1; }
     case "$_v" in
         off | OFF) rm -f "$WORK/update.off"; set_kv AG2A_UPDATE_INTERVAL 0; echo "  已关闭" ;;
         [0-9]:[0-9][0-9] | [01][0-9]:[0-9][0-9] | 2[0-3]:[0-9][0-9])
@@ -199,22 +220,29 @@ auto)
     exit 1
     ;;
 refresh)
+    # 退出码要透传：调用方（面板/脚本）靠它区分「刷了」和「没刷」
     sh "$MODDIR/refresh.sh" "$2"
-    exit 0 ;;
+    exit $? ;;
 log)
     # 网关日志（面板「打开」页下面那块显示的就是这个文件的尾部）。
     # 行数可调：sh action.sh log 120
-    tail -n "${2:-40}" "$WORK/run.log" 2>/dev/null || echo "没有 $WORK/run.log"
+    case "${2:-40}" in
+        '' | *[!0-9]*) _ln=40 ;;
+        *) _ln=$2 ;;
+    esac
+    tail -n "$_ln" "$WORK/run.log" 2>/dev/null || echo "没有 $WORK/run.log"
     exit 0 ;;
 start)
     sh "$MODDIR/service.sh" start
+    _st=$?
     sh "$MODDIR/refresh.sh" quiet >/dev/null 2>&1
-    exit 0 ;;
+    exit "$_st" ;;
 stop)
     sh "$MODDIR/service.sh" stop
+    _st=$?
     sh "$MODDIR/refresh.sh" quiet >/dev/null 2>&1
     echo "网关已停止"
-    exit 0 ;;
+    exit "$_st" ;;
 fixplugins)
     # 插件的解释器问题已由网关侧的 spawn hook 解决（lib.sh 的 ag2a_preload_arg），
     # 插件文件保持原样、签名完好。这个子命令留着只报状态，便于排障。

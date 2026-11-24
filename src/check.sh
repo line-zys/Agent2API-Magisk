@@ -37,12 +37,15 @@ echo "  port=$PORT"
 (netstat -ltnp 2>/dev/null || ss -ltnp 2>/dev/null) | grep ":$PORT" || echo "  未监听（进程没起来）"
 
 echo "== 本地 DNS（dnsfix）=="
+# 执行位先补一遍：KernelSU 的安装器会先把整包压成 0644，靠 dnsd.sh 运行时 chmod 兜，
+# 这里自检时也顺手补上，免得刚刷完就跑 check.sh 看到「未就绪」的假警报。
+chmod 755 "$MODDIR/bin/dnsstub" 2>/dev/null
 if ag2a_dns_listen; then
-    echo "  127.0.0.1:53: 在听（网关一组的域名解析可用）"
+    echo "  53（UDP/TCP）: 在听（网关和插件的域名解析可用）"
 elif [ -f "$WORK/dnsfix/dnsproxy" ]; then
-    echo "  127.0.0.1:53: 没在听 ⚠ 网关外连将全部 DNS 失败"
+    echo "  53（UDP/TCP）: 没在听 ⚠ 网关外连将全部 DNS 失败"
 else
-    echo "  127.0.0.1:53: 没在听（dnsproxy 还没解出来，网关还没用上 dnsfix，正常）"
+    echo "  53（UDP/TCP）: 没在听（dnsproxy 还没解出来，网关还没用上 dnsfix，正常）"
 fi
 _dd=$(ag2a_dnsd_pid)
 [ -n "$_dd" ] && echo "  保活器 dnsd: 在跑（pid $_dd）" || echo "  保活器 dnsd: 未运行"

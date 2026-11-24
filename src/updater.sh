@@ -45,7 +45,11 @@ OFF="$WORK/update.off"
 VERF="$WORK/upstream.version"
 CONF="$WORK/update.conf"
 
-export TZ="$MODDIR/zoneinfo/Asia/Shanghai"
+# 时区：指向模块自带的 tzfile。文件缺失时**不要**导出 —— 指到不存在的路径会让
+# bionic/glibc 回落 UTC，04:00 实际变成北京时间 12:00，而 update.conf 里写的还是 04:00。
+if [ -f "$MODDIR/zoneinfo/Asia/Shanghai" ]; then
+    export TZ="$MODDIR/zoneinfo/Asia/Shanghai"
+fi
 
 # ---- 基础工具 ----
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -96,17 +100,26 @@ fetch() {
         else
             curl -fsSL $_cs -o "$_o" "$_u" && return 0
         fi
+        # ⛔ 以前这里落到 `[ -s "$_o" ]` 就当成功：curl 被 --max-time / --speed-time
+        #    掐断时同样会留下半截文件，于是「截断的 JSON 被解析成没有 tag / 没有 digest」
+        #    ⇒ 一路降级到「无校验装二进制」。现在必须看下载器的退出码。
+        rm -f "$_o"
+        return 1
     elif [ -n "$BUSYBOX" ]; then
         if [ -n "$_h" ]; then
             "$BUSYBOX" wget -q -T 120 -O "$_o" --header "Authorization: Bearer $_h" "$_u" && return 0
         else
             "$BUSYBOX" wget -q -T 120 -O "$_o" "$_u" && return 0
         fi
+        rm -f "$_o"
+        return 1
     elif have wget; then
         wget -q --timeout=120 -O "$_o" "$_u" && return 0
+        rm -f "$_o"
+        return 1
     fi
-    [ -s "$_o" ] || { rm -f "$_o"; return 1; }
-    return 0
+    rm -f "$_o"
+    return 1
 }
 
 # ---- 配置读取 ----
@@ -147,7 +160,14 @@ today_at() {
         fi
     fi
     case "$_s" in '' | *[!0-9]*) _s="" ;; esac
-    [ -n "$_s" ] || _s=$(($(date +%s 2>/dev/null || echo 0) + 60))
+    if [ -z "$_s" ]; then
+        # 纯算术兜底：今天本地 00:00 的 epoch + H:M。不依赖 date -d 支持哪种格式。
+        # ⛔ 别再退回 `now + 60`：那会让 tick 每次醒来都判「已到点」，daemon 直接变回
+        #    60 秒一轮联网 + 反复下载重启（正是文件头痛骂的耗电模式）。
+        _now=$(date +%s 2>/dev/null)
+        case "$_now" in '' | *[!0-9]*) _now=0 ;; esac
+        _s=$((_now - _now % 86400 + _h * 3600 + _m * 60))
+    fi
     echo "$_s"
 }
 
@@ -273,8 +293,16 @@ fetch_asset() {
         fi
         if [ -n "$_ok" ]; then
             if [ -z "$_want" ]; then
-                say "  没有官方摘要可比，接受该源（无法校验）"
-                return 0
+                # ⛔ 绝不能「拿不到官方 digest 就静默接受第一个源」：默认第一个源是第三方
+                #    公共反代，而这份二进制是要以 root 跑的业务进程。要么拿到 digest，
+                #    要么显式打开 AG2A_UPDATE_ALLOW_UNVERIFIED=1 自己承担。
+                if [ "${AG2A_UPDATE_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+                    say "  ⚠ 没有官方摘要可比（AG2A_UPDATE_ALLOW_UNVERIFIED=1），接受该源"
+                    return 0
+                fi
+                say "  ✗ 拿不到官方 sha256（API 不可达，或该 release 没有 digest），拒绝安装"
+                rm -f "$_out"
+                return 2
             fi
             _got=$(sha_of "$_out")
             if [ "$_got" = "$_want" ]; then
@@ -306,6 +334,20 @@ check_once() {
     fi
     [ -n "$SHA" ] || { say "没有 sha256 工具，无法校验，跳过"; mark "失败：无 sha256 工具"; return 1; }
 
+    # 互斥：`updater.sh now` 和 daemon 的 tick 可能同时跑，而下面的临时文件都是固定名
+    # （.rel.json / .rel1.json / .dl.tgz / .staged），互相 rm/截断会解析出空结果。
+    _lk="$WORK/.upd.lock"
+    if ! mkdir "$_lk" 2>/dev/null; then
+        _lp=$(tr -dc '0-9' < "$_lk/pid" 2>/dev/null)
+        if [ -z "$_lp" ] || ! kill -0 "$_lp" 2>/dev/null; then
+            rmdir "$_lk" 2>/dev/null
+            mkdir "$_lk" 2>/dev/null
+        fi
+    fi
+    [ -d "$_lk" ] || { say "另一轮更新正在进行，跳过"; return 3; }
+    printf '%s\n' "$$" > "$_lk/pid" 2>/dev/null
+    trap 'rmdir "$_lk" 2>/dev/null' EXIT INT TERM HUP
+
     ag2a_rotate "$LOG" 262144
 
     _chan=$(conf_get AG2A_UPDATE_CHANNEL)
@@ -334,9 +376,13 @@ check_once() {
     say "发现新版 $_tag（当前 ${_old:-未知}）→ 下载 $ASSET"
     _tgz="$WORK/.dl.tgz"
     _url="https://github.com/$_hit/releases/download/$_tag/$ASSET"
-    fetch_asset "$_url" "$_tgz" "$_want" || {
-        say "所有源都失败（或校验都没过）"; mark "失败：下载/校验"; rm -f "$_tgz"; return 1
-    }
+    fetch_asset "$_url" "$_tgz" "$_want"
+    case "$?" in
+        0) : ;;
+        2) say "没有官方摘要，已拒绝安装（确实要装：AG2A_UPDATE_ALLOW_UNVERIFIED=1）"
+           mark "失败：无官方摘要"; rm -f "$_tgz"; return 1 ;;
+        *) say "所有源都失败（或校验都没过）"; mark "失败：下载/校验"; rm -f "$_tgz"; return 1 ;;
+    esac
     [ -s "$_tgz" ] || { say "下载结果为空"; mark "失败：下载为空"; return 1; }
 
     _st="$WORK/.staged"
@@ -356,6 +402,8 @@ check_once() {
 
     chmod 0755 "$_newbin"
     mkdir -p "$RT/bin" 2>/dev/null
+    # 留一份旧二进制：ui 替换失败时要能整体回滚，不能留下「新 bin + 旧 ui」
+    cp -f "$RT/bin/agent2api-server" "$RT/bin/agent2api-server.bak" 2>/dev/null
     if ! cp -f "$_newbin" "$RT/bin/agent2api-server.new" 2>/dev/null; then
         say "写二进制失败（$RT 不可写/空间不足？）"; rm -rf "$_st"; mark "失败：替换失败"; return 1
     fi
@@ -364,19 +412,32 @@ check_once() {
     }
     say "二进制已替换（$(wc -c < "$RT/bin/agent2api-server" | tr -d ' ') 字节）"
 
-    # 换 UI：先挪旧目录，失败就回滚
+    # 换 UI：先挪旧目录，失败就把旧的换回来。
+    # ⛔ 以前写成 `mv "$_st/ui" "$RT/ui" && rm -rf "$RT/ui.old" || { 回滚 }`：
+    #    rm -rf 失败也会走「回滚」分支，把刚装好的新 ui 又换回旧的，而下面照样
+    #    说「ui 已替换」。现在拆成 if/else，且失败就整体 return 1（不写版本戳）。
     if [ -d "$_st/ui" ]; then
         rm -rf "$RT/ui.old"
         mv "$RT/ui" "$RT/ui.old" 2>/dev/null
-        mv "$_st/ui" "$RT/ui" && rm -rf "$RT/ui.old" || {
-            [ -d "$RT/ui.old" ] && mv "$RT/ui.old" "$RT/ui"
-            say "替换 ui 失败，已回滚"
-        }
-        say "ui 已替换（$(find "$RT/ui" -type f 2>/dev/null | wc -l) 个文件）"
+        if mv "$_st/ui" "$RT/ui" 2>/dev/null; then
+            rm -rf "$RT/ui.old" 2>/dev/null
+            say "ui 已替换（$(find "$RT/ui" -type f 2>/dev/null | wc -l) 个文件）"
+        else
+            [ -d "$RT/ui.old" ] && mv "$RT/ui.old" "$RT/ui" 2>/dev/null
+            [ -d "$RT/ui" ] || mv "$RT/ui.old" "$RT/ui" 2>/dev/null
+            say "替换 ui 失败，二进制回滚到旧版"
+            cp -f "$RT/bin/agent2api-server.bak" "$RT/bin/agent2api-server" 2>/dev/null
+            rm -rf "$_st"
+            mark "失败：ui 替换失败（已回滚）"
+            return 1
+        fi
     fi
 
     rm -rf "$_st"
-    echo "$_tag" > "$VERF"
+    # 版本戳放在最后写：只有二进制 + ui 都到位才算「已更新」。以前 ui 回滚了也照写，
+    # 结果下次 tick 命中「已是最新」⇒ 永远不再修，只能重刷 zip。
+    printf '%s\n' "$_tag" > "$VERF.new" 2>/dev/null &&
+        mv -f "$VERF.new" "$VERF" 2>/dev/null
 
     _rs=$(conf_get AG2A_UPDATE_RESTART)
     [ -n "$_rs" ] || _rs=1
@@ -386,12 +447,18 @@ check_once() {
         return 0
     fi
 
-    # 重启网关：直接调 service.sh restart，不再留 reload 标记等别人轮询
-    sh "$MODDIR/service.sh" restart >/dev/null 2>&1
+    # 重启网关：直接调 service.sh restart，不再留 reload 标记等别人轮询。
+    # 退出码必须看：以前丢了，端口被占/rt 写坏时照样报「已重启」，自检和用户都被骗。
+    if sh "$MODDIR/service.sh" restart >/dev/null 2>&1; then
+        sh "$MODDIR/refresh.sh" quiet >/dev/null 2>&1
+        say "已重启网关"
+        mark "已更新 $_tag，已重启"
+        return 10
+    fi
     sh "$MODDIR/refresh.sh" quiet >/dev/null 2>&1
-    say "已重启网关"
-    mark "已更新 $_tag，已重启"
-    return 10
+    say "文件已更新，但重启网关失败（端口被占？看 run.log）"
+    mark "已更新 $_tag，重启失败"
+    return 1
 }
 
 # tick：按钟点判断今天该不该查。给 crond / 开机流程调用，跑完就退出。
@@ -405,13 +472,27 @@ tick() {
     # 还没到点、或今天已经查过 → 什么都不做
     [ "$_now" -ge "$_slot" ] || exit 0
     [ "$_last" -lt "$_slot" ] || exit 0
+    # 失败重试闸：上次失败后 1 小时内不再联网（防深睡/断网时的反复唤醒风暴）
+    _retry=$(tr -dc '0-9' < "$WORK/update.retry" 2>/dev/null)
+    case "$_retry" in '' | *[!0-9]*) _retry=0 ;; esac
+    if [ "$_retry" -gt 0 ] && [ "$_now" -lt "$((_retry + 3600))" ]; then exit 0; fi
 
     check_once
     _rc=$?
-    # 成功失败都记「今天这个钟点查过了」。
-    # ⛔ 别写成 slot-21600（「6 小时后重试」）：daemon 每 30 分钟醒一次都会重跑 tick，
-    #    那个值让 _last < _slot 恒成立 ⇒ 实际变成每 30 分钟联网重试，整夜反复唤醒。
-    echo "$_slot" > "$STAMP" 2>/dev/null
+    # ⛔ 以前成功失败都写 STAMP：04:00 手机深睡/断网一次失败 = 24 小时不再重试，
+    #    用户把钟点从 04:00 改到 01:00 当天也不再跑。现在：
+    #      0/10（查过 / 更新成功）→ 记下这个钟点，今天不再查
+    #      2（自动更新关着）      → 不记账
+    #      其它（失败）          → 记「尝试时刻」，1 小时后允许再试一次
+    #    不用 slot-21600 那种写法：那会让 _last < _slot 恒成立，变成每 30 分钟联网。
+    case "$_rc" in
+        0 | 10) printf '%s\n' "$_slot" > "$STAMP" 2>/dev/null
+                rm -f "$WORK/update.retry" 2>/dev/null ;;
+        2) : ;;
+        *)      _rt=$(date +%s 2>/dev/null)
+                case "$_rt" in '' | *[!0-9]*) _rt=$_now ;; esac
+                printf '%s\n' "$_rt" > "$WORK/update.retry" 2>/dev/null ;;
+    esac
     exit "$_rc"
 }
 
@@ -442,8 +523,12 @@ daemon() {
                 _slot=$(today_at "$(check_at)")
                 _last=$(tr -dc '0-9' < "$STAMP" 2>/dev/null)
                 [ -n "$_last" ] || _last=0
+                _retry=$(tr -dc '0-9' < "$WORK/update.retry" 2>/dev/null)
+                case "$_retry" in '' | *[!0-9]*) _retry=0 ;; esac
                 if [ "$_last" -ge "$_slot" ]; then
                     _next=$((_slot + 86400))     # 今天查过了，等明天
+                elif [ "$_retry" -gt 0 ] && [ "$_now" -lt "$((_retry + 3600))" ]; then
+                    _next=$((_retry + 3600))     # 上次失败，1 小时后重试
                 else
                     _next=$_slot
                 fi
@@ -462,7 +547,12 @@ daemon() {
 }
 
 case "$1" in
-    now|check)   check_once; exit $? ;;
+    now|check)
+        # 10 = 「已更新」（内部给 tick 用的约定），对外一律当成功，免得脚本判成败时误报
+        check_once
+        _rc=$?
+        [ "$_rc" = "10" ] && _rc=0
+        exit "$_rc" ;;
     daemon)      daemon ;;                    # 常驻定时器（service.sh 拉起）
     tick)        tick ;;                      # tick 自带 exit
     status)
