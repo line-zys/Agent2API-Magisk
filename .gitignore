@@ -10,3 +10,6 @@ build/
 *.tgz
 __pycache__/
 notes.md
+
+# dnsstub：CI 用 aarch64 gcc 从 src/dnsfix/dnsstub.c 现编，二进制不入库
+src/bin/

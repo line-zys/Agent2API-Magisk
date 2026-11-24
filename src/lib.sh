@@ -336,26 +336,82 @@ ag2a_seed_admin() {
     esac
 }
 
-# ---------- 本地 DNS（dnsfix） ----------
-# 背景：glibc 解析走 /etc/resolv.conf，没有这个文件就回落 127.0.0.1:53。Android 没有
-# resolv.conf，所以网关和所有 glibc 二进制的域名解析只有本地 53 端口一条路——
-# $WORK/dnsfix/dnsproxy 就是填这个位的（网关运行时自己解出来并拉起，壳层以前不管）。
-# 出过的两档子事：
-#   1) 解出来的 dnsproxy 没有执行位（0600），execve 永远 EACCES 且网关不重试；
-#   2) dnsproxy 被优雅停掉一次后，网关运行期间不会再拉。
-# 两种情况症状相同：外连全部报「无法连接上游 / dns error」，且不重启服务不会自愈。
-# 壳层兜底：ag2a_dns_fix_perms 每次启动纠执行位；dnsd.sh 事件驱动保活
-# （wait 不轮询），网关自己把端口占了 dnsd 会自动让位。
+# ---------- DNS（两种上游形态，一套壳层兜底） ----------
+# 上游在 3.5.1 换了解析器，这里必须同时伺候两代，否则总有一代会「连不上网」：
+#
+# 【3.5.0 及以前】网关运行时自己解出 dnsfix/dnsproxy，靠 127.0.0.1:53 解析。
+#   踩过两档子事：
+#     1) 解出来的 dnsproxy 被权限归一化收成 0600，execve 永远 EACCES 且网关不重试；
+#     2) dnsproxy 被优雅停掉一次后，运行期不再拉 —— 全进程组 DNS 瘫痪，不重启不自愈。
+#   兜底：ag2a_dns_fix_perms 每次启动纠执行位；dnsd.sh 事件驱动保活（wait 不轮询）。
+#
+# 【3.5.1 起】二进制里已无 dnsfix/dnsproxy/127.0.0.1:53 任何痕迹，改为进程内 hickory
+#   解析器，只读系统 /etc/resolv.conf（二进制里也没有任何硬编码公共 DNS、没有可配的
+#   DNS 环境变量）。而 Android 根本没有 /etc/resolv.conf —— 解析必然失败：
+#     dns error → failed to lookup address information: Temporary failure in name resolution
+#   这就是 26.11.24_1（3.5.1）在手机上「连不上网」的根因，Linux 上同样的二进制一切正常。
+#   兜底：ag2a_write_resolv 在启动网关前写一份 resolv.conf（默认阿里 + DNSPod 并行），
+#   路径给网关自身和它 spawn 的插件一起用。
+#   注意：Android / 是只读的，写不进去；由 ag2a_resolv_env 判断能不能用，
+#   实在没有可写位置时才退回「让 dnsproxy 监听 127.0.0.1:53」那套。
 
-# 执行位自愈。目录可能还不存在（首启、或这版网关不用 dnsfix），静默失败
+# 网关用的上游 DNS 列表（每行一个 IPv4）。可配：$WORK/dnsfix/upstreams 里写
+# "nameserver x.x.x.x" 或纯 IP，一行一个；非法行忽略，最多 4 条；缺省阿里 + DNSPod。
+ag2a_dns_servers() {
+    _uf="$(ag2a_data_dir)/dnsfix/upstreams"
+    _ul=""
+    if [ -r "$_uf" ]; then
+        _ul=$(sed -e 's/\r$//' -e 's/^[[:space:]]*nameserver[[:space:]]*//' "$_uf" 2>/dev/null \
+              | grep -v '^[[:space:]]*#' \
+              | tr -d ' \t' \
+              | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' \
+              | head -n 4)
+    fi
+    [ -n "$_ul" ] || _ul="223.5.5.5
+119.29.29.29"
+    printf '%s\n' "$_ul"
+}
+
+# 生成一份 resolv.conf，把路径 echo 出来；返回非 0 表示没有可写位置。
+# 候选顺序（先挑能写的，内容每次启动重写，幂等）：
+#   $WORK/etc/resolv.conf      数据目录，最稳，网关 HOME 就在这儿
+#   /data/local/tmp/resolv.conf
+# 注意：hickory/system-config 只认编译期写死的 /etc/resolv.conf。Android 的 / 通常是
+# read-only，若无法 bind-mount 到 /etc/resolv.conf，则写入的数据目录版本只能供
+# 「以 LD_PRELOAD 或 chroot 方式启动」的场景使用 —— 因此下面还提供 dnsproxy 复用路径。
+ag2a_write_resolv() {
+    _rd="$(ag2a_data_dir)/etc"
+    mkdir -p "$_rd" 2>/dev/null || return 1
+    _rf="$_rd/resolv.conf"
+    {
+        echo "# ag2a: 由 lib.sh 生成，每次启动重写。上游解析器只认这里。"
+        ag2a_dns_servers | sed 's/^/nameserver /'
+        echo "options timeout:2 attempts:2"
+    } > "$_rf.new" 2>/dev/null || return 1
+    mv -f "$_rf.new" "$_rf" 2>/dev/null || return 1
+    echo "$_rf"
+}
+
+# 生成 resolv.conf 副本（仅供排查/文档参考，不参与解析）。
+# ⚠ 关键结论（实测）：Android 根分区 erofs 只读，既没有 /etc/resolv.conf，
+#   bind mount 也建不出目标文件（挂载直接 ENOENT）。
+#   但 glibc 在「没有可用 resolv.conf」时会回落到 127.0.0.1:53 发查询（已抓包证实），
+#   所以正确解法不是伪造文件，而是确保有人在 127.0.0.1:53 应答 —— 即 dnsproxy。
+#   LD_PRELOAD 重定向方案已实测无效：glibc 读 resolv.conf 走内部符号，不经过 PLT，
+#   open/fopen/stat 全都拦不到。不要再往那个方向做。
+ag2a_resolv_env() {
+    ag2a_write_resolv >/dev/null 2>&1
+    return 0
+}
+
+# 执行位自愈（3.5.0 及以前那代的 dnsproxy）。目录可能不存在，静默失败。
 ag2a_dns_fix_perms() {
     chmod 755 "$(ag2a_data_dir)/dnsfix/dnsproxy" 2>/dev/null
     return 0
 }
 
-# 127.0.0.1:53（或通配 / IPv6）有没有人 LISTEN。
+# 127.0.0.1:53（或通配 / IPv6）有没有人 LISTEN。53 = 0x0035。
 # 与 ag2a_port_listen 同路数：只读 /proc/net/tcp{,6}，一次 awk 判完，不 fork 不联网。
-# 53 = 0x0035。有人在听就别再抢——可能是网关自己拉起来的，也可能是 AdGuard 之类。
 ag2a_dns_listen() {
     awk '
         FNR == 1 { next }
@@ -364,10 +420,7 @@ ag2a_dns_listen() {
     ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
-# 上游 DNS 列表，输出成 dnsproxy 的 -u 参数串（调用方故意不做引号包裹，逐词传给 exec）。
-# 可配文件：$WORK/dnsfix/upstreams，一行一条，内容原样作为 -u 参数，支持
-# udp://x.x.x.x:53、tcp://、以及 DoH/DoT URL；整行 # 开头是注释。
-# 只接受安全字符集（防脏行把命令拆坏），最多 6 条；文件缺失/没有有效行 = 阿里 + DNSPod。
+# dnsproxy 的 -u 参数串（3.5.0 及以前那代用）。故意不做引号包裹，逐词传参。
 ag2a_dns_upstreams() {
     _uf="$(ag2a_data_dir)/dnsfix/upstreams"
     _ul=""
@@ -383,8 +436,7 @@ udp://119.29.29.29:53"
     for _u in $_ul; do printf -- '-u %s ' "$_u"; done
 }
 
-# dnsd 的 pid；没在跑返回非 0。与 watchdog 同款：pidfile + cmdline 双重校验，
-# 防 pid 复用把无关进程当自己的（然后被 kill）。
+# dnsd 的 pid；没在跑返回非 0。pidfile + cmdline 双重校验，防 pid 复用误杀。
 ag2a_dnsd_pid() {
     _dp=$(cat "$(ag2a_data_dir)/dnsd.pid" 2>/dev/null)
     case "$_dp" in '' | *[!0-9]*) return 1 ;; esac
@@ -393,59 +445,13 @@ ag2a_dnsd_pid() {
     echo "$_dp"
 }
 
-# ---------- 本地 DNS（dnsfix） ----------
-# 背景：glibc 解析走 /etc/resolv.conf，没有这个文件就回落 127.0.0.1:53。Android 没有
-# resolv.conf，所以网关和所有 glibc 二进制的域名解析只有本地 53 端口一条路——
-# $WORK/dnsfix/dnsproxy 就是填这个位的（网关运行时自己解出来并拉起，壳层以前不管）。
-# 出过的两档子事：
-#   1) 解出来的 dnsproxy 没有执行位（0600），execve 永远 EACCES 且网关不重试；
-#   2) dnsproxy 被优雅停掉一次后，网关运行期间不会再拉。
-# 两种情况症状相同：外连全部报「无法连接上游 / dns error」，且不重启服务不会自愈。
-# 壳层兜底：ag2a_dns_fix_perms 每次启动纠执行位；dnsd.sh 事件驱动保活
-# （wait 不轮询），网关自己把端口占了 dnsd 会自动让位。
-
-# 执行位自愈。目录可能还不存在（首启、或这版网关不用 dnsfix），静默失败
-ag2a_dns_fix_perms() {
-    chmod 755 "$(ag2a_data_dir)/dnsfix/dnsproxy" 2>/dev/null
-    return 0
-}
-
-# 127.0.0.1:53（或通配 / IPv6）有没有人 LISTEN。
-# 与 ag2a_port_listen 同路数：只读 /proc/net/tcp{,6}，一次 awk 判完，不 fork 不联网。
-# 53 = 0x0035。有人在听就别再抢——可能是网关自己拉起来的，也可能是 AdGuard 之类。
-ag2a_dns_listen() {
-    awk '
-        FNR == 1 { next }
-        $4 == "0A" { n = split($2, a, ":"); if (a[n] == "0035") { f = 1; exit } }
-        END { exit(f ? 0 : 1) }
-    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
-}
-
-# 上游 DNS 列表，输出成 dnsproxy 的 -u 参数串（调用方故意不做引号包裹，逐词传给 exec）。
-# 可配文件：$WORK/dnsfix/upstreams，一行一条，内容原样作为 -u 参数，支持
-# udp://x.x.x.x:53、tcp://、以及 DoH/DoT URL；整行 # 开头是注释。
-# 只接受安全字符集（防脏行把命令拆坏），最多 6 条；文件缺失/没有有效行 = 阿里 + DNSPod。
-ag2a_dns_upstreams() {
-    _uf="$(ag2a_data_dir)/dnsfix/upstreams"
-    _ul=""
-    if [ -r "$_uf" ]; then
-        _ul=$(sed -e 's/\r$//' "$_uf" 2>/dev/null \
-              | grep -v '^[[:space:]]*#' \
-              | tr -d ' \t' \
-              | grep -E '^[A-Za-z0-9+._/:@%?&=-]+$' \
-              | head -n 6)
-    fi
-    [ -n "$_ul" ] || _ul="udp://223.5.5.5:53
-udp://119.29.29.29:53"
-    for _u in $_ul; do printf -- '-u %s ' "$_u"; done
-}
-
-# dnsd 的 pid；没在跑返回非 0。与 watchdog 同款：pidfile + cmdline 双重校验，
-# 防 pid 复用把无关进程当自己的（然后被 kill）。
-ag2a_dnsd_pid() {
-    _dp=$(cat "$(ag2a_data_dir)/dnsd.pid" 2>/dev/null)
-    case "$_dp" in '' | *[!0-9]*) return 1 ;; esac
-    kill -0 "$_dp" 2>/dev/null || return 1
-    grep -q 'dnsd\.sh' "/proc/$_dp/cmdline" 2>/dev/null || return 1
-    echo "$_dp"
+# 网关是否需要 dnsproxy 兜底（= 3.5.0 及以前那一代）。
+# 判据：二进制里是否还带 dnsfix/dnsproxy 痕迹。新代没有，就不该再起 dnsproxy，
+# 免得白占 10MB 内存和 53 端口。
+ag2a_needs_dnsproxy() {
+    _b=$(ag2a_bin)
+    [ -f "$_b" ] || return 1
+    # 只读前 8MB 做采样：两次 O(8MB) 读足够命中（实测新旧两代差异极明显）。
+    _hit=$(head -c 8388608 "$_b" 2>/dev/null | grep -ac 'dnsfix' 2>/dev/null)
+    [ "${_hit:-0}" -gt 0 ] 2>/dev/null
 }

@@ -25,10 +25,18 @@ MODDIR="$(dirname "$(readlink -f "$0")")"
 . "$MODDIR/lib.sh"
 
 WORK=$(ag2a_data_dir)
+# 优先用模块自带的 dnsstub（3.5.1 起网关不再解 dnsproxy，只能自己提供 53 应答者）。
+# 退回旧路径是为了兼容 3.5.0 及以前的网关（它们会自己解出 dnsproxy）。
+STUB="$MODDIR/bin/dnsstub"
 BIN="$WORK/dnsfix/dnsproxy"
+if [ -x "$STUB" ]; then
+    BIN="$STUB"
+fi
 PIDFILE="$WORK/dnsd.pid"
 CPID="$WORK/dnsproxy.pid"
 LOGF="$WORK/dnsfix/dnsproxy.log"
+# 新代网关不再创建 dnsfix/（它已经不碰这个目录了），日志目录得自己建
+mkdir -p "$WORK/dnsfix" 2>/dev/null
 
 # ---------- 单实例 ----------
 # pid 会被复用，必须校验 cmdline 里确实有 dnsd.sh
@@ -56,12 +64,14 @@ _log() {
     echo "$(date '+%m-%d %H:%M:%S') [dnsd] $*" >> "$WORK/run.log" 2>/dev/null
 }
 
-# ---------- 二进制还没解出来：有界地等网关首次使用 ----------
-# 网关在需要 dnsfix 时几秒内就会把二进制解出来；一直没有 = 这版本根本不用它，
-# 不该留常驻进程白占一个进程槽——最多等 10 分钟就退出，之后靠下次网关重启补位。
+# ---------- 等二进制就绪 ----------
+# dnsstub 随模块发布，正常情况下立刻就在；只有退回旧代 dnsproxy 时才需要等网关解出来
+# （网关在首次用到 dnsfix 时几秒内完成，一直不出 = 这版本不用它，最多等 10 分钟退出）。
 ag2a_dns_fix_perms
+chmod 755 "$STUB" 2>/dev/null
 _i=0
-while [ ! -f "$BIN" ] && [ "$_i" -lt 10 ]; do
+while [ ! -x "$BIN" ] && [ "$_i" -lt 10 ]; do
+    [ "$BIN" = "$STUB" ] && break      # 自带 stub 却不可执行 = 打包坏了，别空等
     sleep 60 &
     _sp=$!
     wait "$_sp"
@@ -70,7 +80,7 @@ while [ ! -f "$BIN" ] && [ "$_i" -lt 10 ]; do
     # 等待期间可能有人接了本进程的单（新的 dnsd 覆盖了 pidfile），让位退出
     [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] || exit 0
 done
-if [ ! -f "$BIN" ]; then
+if [ ! -x "$BIN" ]; then
     _log "$BIN 一直没出现（网关没用 dnsfix），退出"
     rm -f "$PIDFILE" 2>/dev/null
     exit 0
@@ -88,9 +98,16 @@ _fails=0
 while :; do
     # 执行位自愈：某些流程会把 dnsfix/ 下的文件收成 0600（见头注释），每轮起之前补一遍
     ag2a_dns_fix_perms
-    # 词分割是故意的：ag2a_dns_upstreams 只吐校验过的安全字符集
-    # shellcheck disable=SC2046
-    "$BIN" -l 127.0.0.1 -p 53 $(ag2a_dns_upstreams) --upstream-mode=parallel --cache >> "$LOGF" 2>&1 &
+    chmod 755 "$STUB" 2>/dev/null
+    # dnsstub 自己读 $WORK/dnsfix/upstreams、自己绑 127.0.0.1:53，无参数。
+    # dnsproxy（旧代）需要 -l/-p/-u 那一套：词分割是故意的，
+    # ag2a_dns_upstreams 只吐校验过的安全字符集。
+    if [ "$BIN" = "$STUB" ]; then
+        "$BIN" >> "$LOGF" 2>&1 &
+    else
+        # shellcheck disable=SC2046
+        "$BIN" -l 127.0.0.1 -p 53 $(ag2a_dns_upstreams) --upstream-mode=parallel --cache >> "$LOGF" 2>&1 &
+    fi
     _dp=$!
     echo "$_dp" > "$CPID" 2>/dev/null
 

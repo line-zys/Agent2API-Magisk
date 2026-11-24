@@ -84,6 +84,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci/rootfs.sh "${{ steps.up.outputs.tag }}"
 
+      - name: 编译 dnsstub（本地 DNS 应答器）
+        # 3.5.1 起网关改用进程内解析器，不再自带 dnsproxy；Android 没有
+        # /etc/resolv.conf，glibc 会回落到 127.0.0.1:53。必须在 53 上有人应答，
+        # 否则所有出站请求 dns error（26.11.24_1 连不上网的根因）。
+        # 源码在 src/dnsfix/dnsstub.c，这里现编，免得把二进制提交进仓库。
+        if: steps.up.outputs.skip != '1'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          mkdir -p src/bin
+          aarch64-linux-gnu-gcc -O2 -Wall -static -o src/bin/dnsstub src/dnsfix/dnsstub.c
+          chmod 0755 src/bin/dnsstub
+          file src/bin/dnsstub || true
+          # 防呆：必须是 aarch64 静态 ELF，否则模块在手机上根本起不来
+          python3 - <<'PYEOF'
+          import sys
+          d = open("src/bin/dnsstub", "rb").read(20)
+          if d[:4] != b"\x7fELF" or int.from_bytes(d[18:20], "little") != 0xB7:
+              sys.exit("dnsstub 不是 aarch64 ELF")
+          print("dnsstub aarch64 ok")
+          PYEOF
+
       - name: 打包
         if: steps.up.outputs.skip != '1'
         env:

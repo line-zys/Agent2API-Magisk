@@ -35,6 +35,10 @@ RUNTIME = {
     os.path.join(SRC, "compat", "libpthread.so.0"): "lib/libpthread.so.0",
     os.path.join(SRC, "compat", "libdl.so.2"): "lib/libdl.so.2",
     os.path.join(SRC, "compat", "librt.so.1"): "lib/librt.so.1",
+    # DNS 应答器：3.5.1 起网关不再自带 dnsproxy，而 Android 没有 /etc/resolv.conf，
+    # glibc 会回落到 127.0.0.1:53 发查询 —— 必须有人在 53 应答，否则全部 dns error。
+    # 源码见 src/dnsfix/dnsstub.c，由 CI 用 aarch64 gcc 编译（见 .github/workflows/build.yml）。
+    os.path.join(SRC, "bin", "dnsstub"): "bin/dnsstub",
     os.path.join(ROOTFS, "etc", "ca-certificates.crt"): "etc/ca-certificates.crt",
     os.path.join(ROOTFS, "usr", "share", "zoneinfo", "Asia", "Shanghai"): "zoneinfo/Asia/Shanghai",
 }

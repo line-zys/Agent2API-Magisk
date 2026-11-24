@@ -46,12 +46,16 @@ else
 fi
 _dd=$(ag2a_dnsd_pid)
 [ -n "$_dd" ] && echo "  保活器 dnsd: 在跑（pid $_dd）" || echo "  保活器 dnsd: 未运行"
-if [ -f "$WORK/dnsfix/dnsproxy" ]; then
+if [ -x "$MODDIR/bin/dnsstub" ]; then
+    echo "  dnsstub: 就绪（模块自带，$(wc -c < "$MODDIR/bin/dnsstub" | tr -d ' ') B）"
+elif [ -f "$WORK/dnsfix/dnsproxy" ]; then
     if [ -x "$WORK/dnsfix/dnsproxy" ]; then
-        echo "  dnsproxy: $(wc -c < "$WORK/dnsfix/dnsproxy" | tr -d ' ') B，执行位 ok"
+        echo "  dnsproxy: $(wc -c < "$WORK/dnsfix/dnsproxy" | tr -d ' ') B，执行位 ok（旧代网关）"
     else
         echo "  dnsproxy: ⚠ 缺执行位！跑 sh $MODDIR/service.sh restart 修复"
     fi
+else
+    echo "  ⚠ 既没有 dnsstub 也没有 dnsproxy —— 3.5.1+ 会导致全部 dns error"
 fi
 
 echo "== 进程 =="

@@ -46,6 +46,17 @@ chmod 755 "$MODDIR"/*.sh "$MODDIR/bin/"* "$MODDIR/lib/ld-linux-aarch64.so.1" "$W
 # 网关 exec 它永远 EACCES、且不重试，整套外连直接 DNS 瘫痪（详见 dnsd.sh 头注释）。
 ag2a_dns_fix_perms
 
+# ---------- 本地 DNS 准备（两种上游形态都要） ----------
+# 3.5.1 起网关用进程内 hickory 解析器，只读 /etc/resolv.conf；Android 没有这个文件
+# ⇒ 所有出站请求 dns error。这里先尽力把生成的文件 bind 到 /etc/resolv.conf。
+AG2A_RESOLV_OK=0
+if ag2a_resolv_env; then
+    AG2A_RESOLV_OK=1
+else
+    echo "$(date '+%m-%d %H:%M') [dns] resolv.conf 副本写入失败，退回本地 dnsproxy" >> "$WORK/run.log" 2>/dev/null
+fi
+export AG2A_RESOLV_OK
+
 stop_gw() {
     [ -n "$(ag2a_pids)" ] || return 0
     for _p in $(ag2a_pids); do kill "$_p" 2>/dev/null; done
@@ -147,6 +158,10 @@ stop_update_timer() {
 # 与 update timer 同款：setsid 脱离会话 + pidfile 幂等；dnsd 内部用 wait 守着
 # dnsproxy，活着零 CPU。start/stop 都可放心重复调。
 start_dnsd() {
+    # 3.5.0 及以前：网关自己会解 dnsproxy，壳层只做保活。
+    # 3.5.1 起：网关不再自解，必须由壳层提供 127.0.0.1:53 的应答者 —— 仍是 dnsproxy。
+    # 两代都需要，所以这里不再按版本跳过。
+    # 唯一例外：53 已被别人占（网关自拉 / AdGuard 等），dnsd 会自己让位退出。
     [ -n "$(ag2a_dnsd_pid)" ] && return 0
     setsid sh "$MODDIR/dnsd.sh" >/dev/null 2>&1 < /dev/null &
     return 0
@@ -251,6 +266,12 @@ eval "$(ag2a_tz_env)"       # 二进制读 /usr/share/zoneinfo
 # 要能找到 libc/libm/libgcc_s，只认 LD_LIBRARY_PATH 这条（Android 无 /lib、无 ld.so.cache）。
 # 插件是网关的子进程，所以在这里 export 就够了。
 export LD_LIBRARY_PATH="$MODDIR/lib"
+
+# ---------- DNS ----------
+# 3.5.1 起网关用进程内 hickory 解析器；Android 没有 /etc/resolv.conf、根分区只读也造不出来。
+# 实测 glibc 在这种情况下会回落到 127.0.0.1:53 发查询（抓包证实），
+# 所以只要有进程在 53 上应答就能解析 —— 那就是 dnsproxy，本脚本用 dnsd 保活它。
+# （LD_PRELOAD 重定向 resolv.conf 已实测无效：glibc 读它走内部符号，拦不到。）
 
 # ---------- 管理员：只在明确设过密码时播种 ----------
 # 上游 env 不参与认证（只认 db 里的 bcrypt 哈希），唯一可用入口是 POST /api/panel/setup。
