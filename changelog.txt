@@ -1,4 +1,4 @@
-**本模块 26.11.24_2**　发布于 14:56 UTC+8
+**本模块 26.11.24_3**　发布于 16:22 UTC+8
 
 - 修复「26.11.24_1（上游 3.5.1）在手机上连不上网、全是 dns error」：上游 3.5.1 把域名解析整体换成进程内 hickory resolver，只读系统 /etc/resolv.conf，而二进制里既没有硬编码公共 DNS、也没有任何可配的 DNS 环境变量；Android 根分区是 erofs 只读、根本没有这个文件，bind mount 也建不出目标（实测目标路径 ENOENT）。此时 glibc 会回落到 127.0.0.1:53 发查询（抓包已证实能收到查询包），但 3.5.1 也不再像旧版那样自动解出 dnsproxy 来应答 —— 于是所有出站请求一律 dns error → Temporary failure in name resolution。现在模块自带一个 71KB 的静态 DNS 转发器 bin/dnsstub（源码 src/dnsfix/dnsstub.c，CI 用 aarch64 gcc 现编，不提交二进制），由 dnsd.sh 保活并常驻 127.0.0.1:53：并发向上游抢答、带 TTL 缓存、端口被占则体面让位。实测在「空 resolv.conf」环境下 getaddrinfo 从 -3 恢复为 0。上游可配：/data/adb/ag2a/dnsfix/upstreams 一行一个 IP，缺省阿里 + DNSPod。
 - 顺带修掉 lib.sh 里的一段重复代码：本地 DNS 那四个函数（ag2a_dns_fix_perms 等）曾被追加两次、各定义两遍，文件里出现两块一模一样的「本地 DNS（dnsfix）」小节。重复定义时后者覆盖前者、行为上侥幸没错，但每次加载多跑一遍、后续改动容易只改到其中一份。现在合并为一处。
