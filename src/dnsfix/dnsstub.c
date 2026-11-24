@@ -38,8 +38,8 @@ static struct sockaddr_in g_up[MAX_UP];
 static int g_nup = 0;
 
 typedef struct {
-    uint8_t key[256];
-    int keylen;
+    uint64_t hash;          /* 查询内容的 64 位哈希（不含事务 ID） */
+    int keylen;             /* 原始查询长度，参与校验，防截断碰撞 */
     uint8_t data[MAX_PKT];
     int len;
     time_t expire;
@@ -48,20 +48,25 @@ typedef struct {
 static cache_ent g_cache[CACHE_SLOTS];
 static unsigned g_cache_rr = 0;
 
-static void cache_key(const uint8_t *p, int n, uint8_t *out, int *outlen) {
-    if (n <= 2) { *outlen = 0; return; }
-    int m = n - 2;
-    if (m > 256) m = 256;
-    memcpy(out, p + 2, (size_t)m);
-    *outlen = m;
+/* FNV-1a 64 位：把整段查询（去掉事务 ID）压成一个哈希。
+ * ⚠ 原来是「截断到前 256 字节做 key」，超过 258 字节的报文（EDNS0/大附加段）
+ *   会出现不同查询共用一条缓存 —— 实测可构造碰撞。改用哈希 + 长度校验。 */
+static uint64_t hash_query(const uint8_t *p, int n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 2; i < n; i++) {          /* 跳过事务 ID */
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)n;                       /* 长度参与，防不同长度同哈希 */
+    return h;
 }
 
-static int cache_get(const uint8_t *key, int keylen, uint8_t *out, int *outlen) {
+static int cache_get(uint64_t hash, int keylen, uint8_t *out, int *outlen) {
     if (keylen <= 0) return 0;
     time_t now = time(NULL);
     for (int i = 0; i < CACHE_SLOTS; i++) {
         cache_ent *e = &g_cache[i];
-        if (e->keylen == keylen && e->len > 0 && memcmp(e->key, key, (size_t)keylen) == 0) {
+        if (e->keylen == keylen && e->hash == hash && e->len > 0) {
             if (e->expire <= now) { e->len = 0; return 0; }
             memcpy(out, e->data, (size_t)e->len);
             *outlen = e->len;
@@ -71,12 +76,12 @@ static int cache_get(const uint8_t *key, int keylen, uint8_t *out, int *outlen) 
     return 0;
 }
 
-static void cache_put(const uint8_t *key, int keylen, const uint8_t *data, int len, int ttl) {
+static void cache_put(uint64_t hash, int keylen, const uint8_t *data, int len, int ttl) {
     if (keylen <= 0 || len <= 0 || len > MAX_PKT) return;
     if (ttl < 5) ttl = 5;
     if (ttl > CACHE_MAX_TTL) ttl = CACHE_MAX_TTL;
     cache_ent *e = &g_cache[g_cache_rr++ % CACHE_SLOTS];
-    memcpy(e->key, key, (size_t)keylen);
+    e->hash = hash;
     e->keylen = keylen;
     memcpy(e->data, data, (size_t)len);
     e->len = len;
@@ -246,15 +251,16 @@ int main(void) {
     printf("[dnsstub] 监听 %s:53，上游 %s\n", LISTEN_ADDR, ups);
     fflush(stdout);
 
-    static uint8_t q[MAX_PKT], r[MAX_PKT], key[256];
+    static uint8_t q[MAX_PKT], r[MAX_PKT];
     for (;;) {
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
         int n = (int)recvfrom(fd, q, sizeof(q), 0, (struct sockaddr *)&from, &fl);
         if (n <= 12) continue;
 
-        int keylen = 0, rn = 0;
-        cache_key(q, n, key, &keylen);
+        int rn = 0;
+        int keylen = n;
+        uint64_t key = hash_query(q, n);
 
         if (cache_get(key, keylen, r, &rn)) {
             r[0] = q[0];
