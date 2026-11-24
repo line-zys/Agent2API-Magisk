@@ -210,8 +210,9 @@ int main(void) {
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { perror("[dnsstub] socket"); return 1; }
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    /* ⚠ 千万不要设 SO_REUSEADDR：UDP 下它允许多个进程同时绑同一端口，
+     * 于是两个 dnsstub 会各收到一部分查询、应答互相覆盖（实测复现）。
+     * 不设它，第二个实例 bind 直接 EADDRINUSE，才能正确触发「让位退出」。 */
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
